@@ -35,9 +35,12 @@ export async function api(method, path, body, idemKey) {
 export const fmtBytes = (n) => {
   if (n === null || n === undefined) return "-";
   if (n === 0) return "0 B";
+  // 负向流水（释放预留 / 删除回收）必须保持符号，Math.log(负数)=NaN 会把单位算坏
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(n);
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
-  return `${(n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+  const i = Math.min(units.length - 1, Math.floor(Math.log(abs) / Math.log(1024)));
+  return `${sign}${(abs / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 };
 
 export const fmtTime = (t) => {

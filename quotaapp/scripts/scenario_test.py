@@ -26,6 +26,14 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
 PASS, FAIL = 0, 0
 TEAM_ID = None
 
+# 每次运行一个唯一前缀：测试要验证“同键重试返回同一会话”，所以仍需固定键，
+# 但不能与历史运行残留的会话撞键（idempotency_key 全局唯一是正确的服务端行为）。
+RUN_ID = uuid.uuid4().hex[:12]
+
+
+def K(name):
+    return f"{RUN_ID}:{name}"
+
 
 def call(method, path, body=None, idem=None, raw=False):
     url = path if path.startswith("http") else BASE + path
@@ -89,9 +97,13 @@ def reserve(team_id, size, key=None, retention=0, ttl=None):
     return call("POST", f"/api/teams/{team_id}/uploads", body, idem=key or uuid.uuid4().hex)
 
 
-def upload_full(team_id, size, key=None, retention=0, data_byte=0x5a):
-    """预留 -> 预签 -> 直传 -> 完成 的完整单分片上传。"""
-    st, r = reserve(team_id, size, key=key, retention=retention)
+def upload_full(team_id, size, key=None, retention=0, data_byte=0x5a, ttl=600):
+    """预留 -> 预签 -> 直传 -> 完成 的完整单分片上传。
+
+    ttl 默认 600s：场景只关心完成/乱序语义，不应在高负载（如并行跑无头浏览器）
+    时被 30s 默认 TTL 抢先回收；专门验证 TTL 的场景会自行传短 ttl。
+    """
+    st, r = reserve(team_id, size, key=key, retention=retention, ttl=ttl)
     assert st == 201, r
     sid = r["session"]["id"]
     st, sig = call("POST", f"/api/uploads/{sid}/parts/1", idem=uuid.uuid4().hex)
@@ -138,13 +150,13 @@ def scenario_failure_abort():
     print("\n[2] 上传失败与取消：失败的 complete 不入账，abort 释放预留")
     tid = new_team("fail", 1024 * 1024)
     # 显式长 TTL，避免演示环境 30s 默认 TTL 在断言前正常回收
-    st, r = reserve(tid, 400 * 1024, key="fail-session-1", ttl=600)
+    st, r = reserve(tid, 400 * 1024, key=K("fail-session-1"), ttl=600)
     sid = r["session"]["id"]
     check("预留 400KiB 成功", st == 201)
     # 领取分片 URL（触发 MinIO multipart 创建），但不直传任何字节，直接 complete -> 存储失败
-    st, sig = call("POST", f"/api/uploads/{sid}/parts/1", idem="fail-sign-1")
+    st, sig = call("POST", f"/api/uploads/{sid}/parts/1", idem=K("fail-sign-1"))
     st, done = call("POST", f"/api/uploads/{sid}/complete",
-                    {"parts": [{"part_number": 1, "etag": '"deadbeef"'}]}, idem="fail-complete-1")
+                    {"parts": [{"part_number": 1, "etag": '"deadbeef"'}]}, idem=K("fail-complete-1"))
     check("存储侧失败 complete 返回非 2xx", st >= 400, f"status={st} {done}")
     t = call("GET", f"/api/teams/{tid}")[1]
     check("失败回调没有记任何占用", t["occupied_bytes"] == 0, str(t))
@@ -152,12 +164,12 @@ def scenario_failure_abort():
     es = call("GET", f"/api/teams/{tid}/ledger")[1]["entries"]
     check("账本只有一条 reserve，无 commit", [e["entry_type"] for e in es] == ["reserve"])
     # 用户取消
-    st, ab = call("POST", f"/api/uploads/{sid}/abort", idem="fail-abort-1")
+    st, ab = call("POST", f"/api/uploads/{sid}/abort", idem=K("fail-abort-1"))
     check("abort 释放成功 released=true", st == 200 and ab.get("released") is True, str(ab))
     t = call("GET", f"/api/teams/{tid}")[1]
     check("预留归零、余额恢复", t["reserved_bytes"] == 0 and t["available_bytes"] == t["quota_bytes"])
     # 乱序：abort 后又来一个 abort（或先 complete 后 abort）——不重复释放
-    st, ab2 = call("POST", f"/api/uploads/{sid}/abort", idem="fail-abort-dup")
+    st, ab2 = call("POST", f"/api/uploads/{sid}/abort", idem=K("fail-abort-dup"))
     check("重复 abort 幂等 released=false", ab2.get("released") is False, str(ab2))
     check("余额保持不变", call("GET", f"/api/teams/{tid}")[1]["reserved_bytes"] == 0)
 
@@ -165,7 +177,7 @@ def scenario_failure_abort():
 def scenario_out_of_order():
     print("\n[3] 回调乱序：成功完成后 complete/abort 重放都不多记一次")
     tid = new_team("order", 1024 * 1024)
-    key = "order-up-1"
+    key = K("order-up-1")
     st, done, sid = upload_full(tid, 300 * 1024, key=key)
     oid = done["object_id"]
     check("首次完成 200", st == 200, str(done))
@@ -174,7 +186,7 @@ def scenario_out_of_order():
                       {"parts": [{"part_number": 1, "etag": "x"}]}, idem=key)
     check("complete 重放幂等", st2 == 200 and done2.get("idempotent_replay"), str(done2))
     # 乱序 abort
-    st3, ab = call("POST", f"/api/uploads/{sid}/abort", idem="order-abort-late")
+    st3, ab = call("POST", f"/api/uploads/{sid}/abort", idem=K("order-abort-late"))
     check("完成后迟到的 abort 不释放", ab.get("released") is False, str(ab))
     t = call("GET", f"/api/teams/{tid}")[1]
     check("占用仍是 300KiB、预留 0", t["occupied_bytes"] == 300 * 1024 and t["reserved_bytes"] == 0)
@@ -190,16 +202,16 @@ def scenario_out_of_order():
 def scenario_retention():
     print("\n[4] 保留期：未到期后端拒绝删除（管理界面/API 同一道校验），到期自动回收")
     tid = new_team("ret", 4 * 1024 * 1024)
-    st, done, sid = upload_full(tid, 256 * 1024, key="ret-obj-long", retention=3600)
+    st, done, sid = upload_full(tid, 256 * 1024, key=K("ret-obj-long"), retention=3600)
     oid = done["object_id"]
     check("带保留期对象上传成功", st == 200, str(done))
-    st, d = call("DELETE", f"/api/objects/{oid}?team_id={tid}", idem="ret-del-1")
+    st, d = call("DELETE", f"/api/objects/{oid}?team_id={tid}", idem=K("ret-del-1"))
     check("未到期删除被拒绝 423", st == 423, f"status={st} {d}")
     check("错误码 retention_locked", isinstance(d, dict) and d.get("code") == "retention_locked", str(d))
     t = call("GET", f"/api/teams/{tid}")[1]
     check("拒绝删除后占用不变", t["occupied_bytes"] == 256 * 1024)
     # 短保留期对象：2s 后应被 sweeper 回收
-    st2, done2, sid2 = upload_full(tid, 128 * 1024, key="ret-obj-short", retention=2, data_byte=0x33)
+    st2, done2, sid2 = upload_full(tid, 128 * 1024, key=K("ret-obj-short"), retention=2, data_byte=0x33)
     oid2 = done2["object_id"]
     check("短保留期对象上传成功", st2 == 200)
     print("    等待 sweeper（约 8s）...")
@@ -218,7 +230,7 @@ def scenario_retention():
     objs = call("GET", f"/api/teams/{tid}/objects")[1]["objects"]
     check("存活对象列表里已无到期对象", all(x["id"] != oid2 for x in objs))
     # 长保留对象仍受保护
-    st, d = call("DELETE", f"/api/objects/{oid}?team_id={tid}", idem="ret-del-2")
+    st, d = call("DELETE", f"/api/objects/{oid}?team_id={tid}", idem=K("ret-del-2"))
     check("长保留对象仍不可删", st == 423)
     # 可追溯：回收动作为 ledger 中的 delete 条目，且关联会话与对象
     es = call("GET", f"/api/teams/{tid}/ledger")[1]["entries"]
@@ -229,11 +241,11 @@ def scenario_retention():
 def scenario_session_ttl():
     print("\n[5] 会话 TTL：只预留不上传，超时自动释放并中止 MinIO multipart")
     tid = new_team("ttl", 1024 * 1024)
-    st, r = reserve(tid, 200 * 1024, key="ttl-session-1", ttl=5)
+    st, r = reserve(tid, 200 * 1024, key=K("ttl-session-1"), ttl=5)
     sid = r["session"]["id"]
     check("短 TTL 预留成功", st == 201)
     # 触发 multipart 创建，验证 sweeper 补偿中止
-    call("POST", f"/api/uploads/{sid}/parts/1", idem="ttl-sign-1")
+    call("POST", f"/api/uploads/{sid}/parts/1", idem=K("ttl-sign-1"))
     print("    等待 TTL+sweeper（约 9s）...")
     expired = False
     for _ in range(12):
@@ -248,7 +260,7 @@ def scenario_session_ttl():
     check("预留自动释放、配额恢复", t["reserved_bytes"] == 0 and t["available_bytes"] == t["quota_bytes"], str(t))
     # 过期会话不允许再 complete
     st, d = call("POST", f"/api/uploads/{sid}/complete",
-                 {"parts": [{"part_number": 1, "etag": "x"}]}, idem="ttl-complete-late")
+                 {"parts": [{"part_number": 1, "etag": "x"}]}, idem=K("ttl-complete-late"))
     check("过期会话 complete 被拒", st == 409, f"status={st}")
     es = call("GET", f"/api/teams/{tid}/ledger")[1]["entries"]
     rel = [e for e in es if e["entry_type"] == "release"]
@@ -258,9 +270,9 @@ def scenario_session_ttl():
 def scenario_trace_e2e():
     print("\n[6] 端到端可追溯：占用变化逐笔对应会话与对象")
     tid = new_team("trace", 10 * 1024 * 1024)
-    st, d1, s1 = upload_full(tid, 100 * 1024, key="trace-up-1")
-    st, d2, s2 = upload_full(tid, 200 * 1024, key="trace-up-2")
-    call("DELETE", f"/api/objects/{d1['object_id']}?team_id={tid}", idem="trace-del-1")
+    st, d1, s1 = upload_full(tid, 100 * 1024, key=K("trace-up-1"))
+    st, d2, s2 = upload_full(tid, 200 * 1024, key=K("trace-up-2"))
+    call("DELETE", f"/api/objects/{d1['object_id']}?team_id={tid}", idem=K("trace-del-1"))
     es = call("GET", f"/api/teams/{tid}/ledger")[1]["entries"]
     by_session = {}
     for e in es:

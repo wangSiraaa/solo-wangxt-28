@@ -242,6 +242,8 @@ function SessionsTable({ sessions }) {
 
 function LedgerTable({ entries }) {
   const label = { reserve: "预留", commit: "转占用", release: "释放预留", delete: "删除回收", reclaim: "到期回收" };
+  // 带符号的金额：fmtBytes 已处理负号（释放/回收），正数补 +，0 显示 —
+  const signed = (n) => (n ? (n > 0 ? "+" : "") + fmtBytes(n) : "—");
   return (
     <div className="card">
       <table>
@@ -259,10 +261,10 @@ function LedgerTable({ entries }) {
               <td className="mono">{e.id}</td>
               <td><span className={`tag ${e.entry_type}`}>{label[e.entry_type] || e.entry_type}</span></td>
               <td className="right mono" style={{ color: e.delta_reserved ? "var(--amber)" : undefined }}>
-                {e.delta_reserved ? (e.delta_reserved > 0 ? "+" : "") + fmtBytes(e.delta_reserved) : "—"}
+                {signed(e.delta_reserved)}
               </td>
               <td className="right mono" style={{ color: e.delta_occupied ? (e.delta_occupied > 0 ? "var(--accent)" : "var(--purple)") : undefined }}>
-                {e.delta_occupied ? (e.delta_occupied > 0 ? "+" : "") + fmtBytes(e.delta_occupied) : "—"}
+                {signed(e.delta_occupied)}
               </td>
               <td className="right mono">{fmtBytes(e.reserved_after)}</td>
               <td className="right mono">{fmtBytes(e.occupied_after)}</td>
